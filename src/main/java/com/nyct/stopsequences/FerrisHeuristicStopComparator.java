@@ -28,15 +28,15 @@ import java.util.*;
 @AllArgsConstructor
 class FerrisHeuristicStopComparator implements Comparator<Stop> {
 
-    private final DirectedAcyclicGraph<Stop, DefaultEdge> _graph;
+    private final DirectedAcyclicGraph<Stop, DefaultEdge> graph;
 
-    private final Map<Stop, Double> _maxDistance = new HashMap<>();
+    private final Map<Stop, Double> maxDistanceMap = new HashMap<>();
 
-    private final GeodeticCalculator _gc = new GeodeticCalculator();
+    private final GeodeticCalculator gc = new GeodeticCalculator();
 
     public int compare(Stop o1, Stop o2) {
-        double d1 = getMaxDistance(o1);
-        double d2 = getMaxDistance(o2);
+        final double d1 = getMaxDistance(o1);
+        final double d2 = getMaxDistance(o2);
         return Double.compare(d2, d1);
     }
 
@@ -45,29 +45,26 @@ class FerrisHeuristicStopComparator implements Comparator<Stop> {
     }
 
     private double getMaxDistance(Stop stop, Set<Stop> visited) {
-        Double d = _maxDistance.get(stop);
-        if (d != null) {
-            return d;
-        }
-
-        if (!visited.add(stop)) {
-            throw new IllegalStateException("cycle");
-        }
-
-        double dMax = 0.0;
-        for (Stop next : _graph.getDescendants(stop)) {
-            double potential = _gc.calculateGeodeticCurve(
-                    Ellipsoid.WGS84,
-                    new GlobalCoordinates(stop.getLat(), stop.getLon()),
-                    new GlobalCoordinates(next.getLat(), next.getLon())
-            )
-                    .getEllipsoidalDistance()
-                    + getMaxDistance(next, visited);
-            if (potential > dMax) {
-                dMax = potential;
+        if (!maxDistanceMap.containsKey(stop)) {
+            if (!visited.add(stop)) {
+                throw new IllegalStateException("cycle");
             }
+
+            final double dMax = graph.getDescendants(stop)
+                    .stream()
+                    .mapToDouble(next -> gc.calculateGeodeticCurve(
+                            Ellipsoid.WGS84,
+                            new GlobalCoordinates(stop.getLat(), stop.getLon()),
+                            new GlobalCoordinates(next.getLat(), next.getLon())
+                    )
+                            .getEllipsoidalDistance()
+                            + getMaxDistance(next, visited))
+                    .max()
+                    .orElse(0.0);
+
+            maxDistanceMap.put(stop, dMax);
         }
-        _maxDistance.put(stop, dMax);
-        return dMax;
+
+        return maxDistanceMap.get(stop);
     }
 }

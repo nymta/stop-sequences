@@ -4,11 +4,9 @@ import com.fasterxml.jackson.databind.ObjectWriter;
 import com.fasterxml.jackson.databind.SequenceWriter;
 import com.fasterxml.jackson.dataformat.csv.CsvMapper;
 import com.fasterxml.jackson.dataformat.csv.CsvSchema;
-import com.fasterxml.jackson.module.paramnames.ParameterNamesModule;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterators;
 import com.google.common.collect.PeekingIterator;
-import com.google.common.collect.Streams;
 import org.jgrapht.graph.DefaultEdge;
 import org.jgrapht.graph.DirectedAcyclicGraph;
 import org.jgrapht.traverse.TopologicalOrderIterator;
@@ -19,25 +17,40 @@ import org.onebusaway.gtfs.model.StopTime;
 import org.onebusaway.gtfs.model.Trip;
 import org.onebusaway.gtfs.serialization.GtfsReader;
 import org.onebusaway.gtfs.services.GtfsMutableRelationalDao;
+import picocli.CommandLine;
+import picocli.CommandLine.Command;
+import picocli.CommandLine.Parameters;
 
 import java.io.File;
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Callable;
 import java.util.function.Predicate;
 import java.util.stream.Stream;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
+import static com.google.common.collect.Streams.mapWithIndex;
+import static com.google.common.collect.Streams.stream;
 
-public class Main {
+@Command(name = "stop-sequences", mixinStandardHelpOptions = true, version = "1.0-SNAPSHOT",
+        description = "Generate a stop sequences file from GTFS.")
+public class StopSequences implements Callable<Integer> {
     private final Predicate<StopTime> REVENUE_STOPTIME = st -> st.getPickupType() == 0 || st.getDropOffType() == 0;
     private final Map<String, String> DIRECTIONS = ImmutableMap.of("0", "N", "1", "S");
 
     GtfsMutableRelationalDao dao;
 
-    public void run() throws IOException {
-        GtfsReader reader = new GtfsReader();
-        reader.setInputLocation(new File("/Users/kurt/Downloads/google_transit_brooklyn.zip"));
+    @Parameters(index = "0")
+    File gtfsFile;
+
+    @Parameters(index = "1")
+    File masterStopListFile;
+
+    @Override
+    public Integer call() throws IOException {
+        final GtfsReader reader = new GtfsReader();
+        reader.setInputLocation(gtfsFile);
 
         dao = new GtfsRelationalDaoImpl();
         reader.setEntityStore(dao);
@@ -46,26 +59,25 @@ public class Main {
 
         final List<MasterStopListEntry> masterStopListEntries = dao.getAllRoutes()
                 .stream()
-                .flatMap(
-                        route -> DIRECTIONS.keySet().stream()
-                                .flatMap(directionId -> stopSequencesForRouteAndDirection(route, directionId))
-                )
+                .flatMap(route -> DIRECTIONS
+                        .keySet()
+                        .stream()
+                        .flatMap(directionId -> stopSequencesForRouteAndDirection(route, directionId)))
                 .collect(toImmutableList());
 
         final CsvMapper mapper = new CsvMapper();
-        mapper.registerModule(new ParameterNamesModule());
         final CsvSchema schema = mapper.schemaFor(MasterStopListEntry.class).withHeader();
         final ObjectWriter writer = new CsvMapper().writerFor(MasterStopListEntry.class).with(schema);
 
-        final SequenceWriter sequenceWriter = writer.writeValues(new File("master_stop_list.csv"));
+        try (final SequenceWriter sequenceWriter = writer.writeValues(masterStopListFile)) {
+            sequenceWriter.writeAll(masterStopListEntries);
+        }
 
-        sequenceWriter.writeAll(masterStopListEntries);
-
-        sequenceWriter.close();
+        return 0;
     }
 
-    public static void main(String[] args) throws IOException {
-        new Main().run();
+    public static void main(String[] args) {
+        System.exit(new CommandLine(new StopSequences()).execute(args));
     }
 
     private Stream<Trip> tripsForRouteAndDirection(Route route, String directionId) {
@@ -73,8 +85,9 @@ public class Main {
                 .filter(t -> t.getDirectionId().equals(directionId));
     }
 
+    @SuppressWarnings("UnstableApiUsage")
     private Stream<MasterStopListEntry> stopSequencesForRouteAndDirection(Route route, String directionId) {
-        DirectedAcyclicGraph<Stop, DefaultEdge> stopsDag = new DirectedAcyclicGraph<>(DefaultEdge.class);
+        final DirectedAcyclicGraph<Stop, DefaultEdge> stopsDag = new DirectedAcyclicGraph<>(DefaultEdge.class);
 
         tripsForRouteAndDirection(route, directionId)
                 .flatMap(t -> dao.getStopTimesForTrip(t).stream())
@@ -85,15 +98,15 @@ public class Main {
 
         tripsForRouteAndDirection(route, directionId)
                 .forEach(t -> {
-                    PeekingIterator<StopTime> it = Iterators.peekingIterator(dao.getStopTimesForTrip(t)
+                    final PeekingIterator<StopTime> it = Iterators.peekingIterator(dao.getStopTimesForTrip(t)
                             .stream()
                             .filter(REVENUE_STOPTIME)
                             .iterator());
 
                     while (it.hasNext()) {
-                        StopTime now = it.next();
+                        final StopTime now = it.next();
                         if (it.hasNext()) {
-                            StopTime next = it.peek();
+                            final StopTime next = it.peek();
                             if (!stopsDag.containsEdge(next.getStop(), now.getStop())) {
                                 stopsDag.addEdge(now.getStop(), next.getStop());
                             }
@@ -102,11 +115,12 @@ public class Main {
 
                 });
 
-        TopologicalOrderIterator<Stop, DefaultEdge> stopIterator = new TopologicalOrderIterator<>(stopsDag,
+        final TopologicalOrderIterator<Stop, DefaultEdge> stopIterator = new TopologicalOrderIterator<>(stopsDag,
                 new FerrisHeuristicStopComparator(stopsDag));
 
-        return Streams.mapWithIndex(Streams.stream(stopIterator),
-                (stop, index) -> new MasterStopListEntry(route.getShortName(),
+        return mapWithIndex(stream(stopIterator),
+                (stop, index) -> new MasterStopListEntry(
+                        route.getShortName(),
                         DIRECTIONS.get(directionId),
                         (int) index + 1,
                         stop.getId().getId(),
