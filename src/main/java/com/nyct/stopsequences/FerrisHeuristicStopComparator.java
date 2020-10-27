@@ -41,7 +41,7 @@ class FerrisHeuristicStopComparator implements Comparator<Stop> {
     }
 
     private double getMaxDistance(Stop stop) {
-        return getMaxDistance(stop, new HashSet<Stop>());
+        return getMaxDistance(stop, new HashSet<>());
     }
 
     private double getMaxDistance(Stop stop, Set<Stop> visited) {
