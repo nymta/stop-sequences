@@ -58,8 +58,8 @@ class FerrisHeuristicStopComparator implements Comparator<Stop> {
         for (Stop next : _graph.getDescendants(stop)) {
             double potential = _gc.calculateGeodeticCurve(
                     Ellipsoid.WGS84,
-                    new GlobalCoordinates(stop.getLon(), stop.getLat()),
-                    new GlobalCoordinates(next.getLon(), next.getLat())
+                    new GlobalCoordinates(stop.getLat(), stop.getLon()),
+                    new GlobalCoordinates(next.getLat(), next.getLon())
             )
                     .getEllipsoidalDistance()
                     + getMaxDistance(next, visited);
