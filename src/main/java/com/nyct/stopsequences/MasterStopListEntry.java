@@ -14,7 +14,7 @@ public class MasterStopListEntry {
     @JsonProperty("lineabbr")
     String lineAbbr;
     String direction;
-    int sequence;
+    long sequence;
     String stopId;
     @JsonProperty("stoptype")
     String stopType;

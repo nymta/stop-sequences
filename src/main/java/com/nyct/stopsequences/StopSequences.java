@@ -7,6 +7,10 @@ import com.fasterxml.jackson.dataformat.csv.CsvSchema;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterators;
 import com.google.common.collect.PeekingIterator;
+import com.google.common.collect.Streams;
+import freemarker.template.TemplateException;
+import org.apache.commons.lang3.tuple.ImmutablePair;
+import org.apache.commons.lang3.tuple.Pair;
 import org.jgrapht.graph.DefaultEdge;
 import org.jgrapht.graph.DirectedAcyclicGraph;
 import org.jgrapht.traverse.TopologicalOrderIterator;
@@ -19,19 +23,21 @@ import org.onebusaway.gtfs.serialization.GtfsReader;
 import org.onebusaway.gtfs.services.GtfsMutableRelationalDao;
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
+import picocli.CommandLine.Option;
 import picocli.CommandLine.Parameters;
 
 import java.io.File;
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.function.Predicate;
 import java.util.stream.Stream;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
-import static com.google.common.collect.Streams.mapWithIndex;
-import static com.google.common.collect.Streams.stream;
+import static com.google.common.collect.ImmutableMap.toImmutableMap;
+import static com.google.common.collect.ImmutableSet.toImmutableSet;
 
 @Command(name = "stop-sequences", mixinStandardHelpOptions = true, version = "1.0-SNAPSHOT",
         description = "Generate a stop sequences file from GTFS.")
@@ -39,16 +45,19 @@ public class StopSequences implements Callable<Integer> {
     private final Predicate<StopTime> REVENUE_STOPTIME = st -> st.getPickupType() == 0 || st.getDropOffType() == 0;
     private final Map<String, String> DIRECTIONS = ImmutableMap.of("0", "N", "1", "S");
 
-    GtfsMutableRelationalDao dao;
+    private GtfsMutableRelationalDao dao;
 
-    @Parameters(index = "0")
-    File gtfsFile;
+    @Parameters(index = "0", description = "GTFS Zip file or directory")
+    private File gtfsFile;
 
-    @Parameters(index = "1")
-    File masterStopListFile;
+    @Parameters(index = "1", description = "master stop list CSV")
+    private File masterStopListFile;
+
+    @Option(names = {"--debugOutput"}, description = "HTML debug output file")
+    private File debugOutputFile;
 
     @Override
-    public Integer call() throws IOException {
+    public Integer call() throws IOException, TemplateException {
         final GtfsReader reader = new GtfsReader();
         reader.setInputLocation(gtfsFile);
 
@@ -57,12 +66,33 @@ public class StopSequences implements Callable<Integer> {
 
         reader.run();
 
-        final List<MasterStopListEntry> masterStopListEntries = dao.getAllRoutes()
+        final List<RouteAndDirection> routes = dao.getAllRoutes()
                 .stream()
                 .flatMap(route -> DIRECTIONS
                         .keySet()
                         .stream()
-                        .flatMap(directionId -> stopSequencesForRouteAndDirection(route, directionId)))
+                        .map(directionId -> {
+                            final DirectedAcyclicGraph<Stop, DefaultEdge> stopsDag = stopsDagForRouteAndDirection(route, directionId);
+                            final Map<Stop, Long> stopSequences = stopSequences(stopsDag);
+                            final Set<String> tripHeadsigns = tripHeadsignsForRouteAndDirection(route, directionId);
+
+                            return new RouteAndDirection(route, directionId, stopsDag, stopSequences, tripHeadsigns);
+                        }))
+                .collect(toImmutableList());
+
+        if (debugOutputFile != null) {
+            SequenceDebugger.visualizeSequences(routes, debugOutputFile);
+        }
+
+        final List<MasterStopListEntry> masterStopListEntries = routes
+                .stream()
+                .flatMap(r -> {
+                    final Route route = r.getRoute();
+                    final String directionId = r.getDirectionId();
+                    final Map<Stop, Long> stopSequences = r.getStopSequences();
+
+                    return buildMasterStopListEntries(route, directionId, stopSequences);
+                })
                 .collect(toImmutableList());
 
         final CsvMapper mapper = new CsvMapper();
@@ -81,12 +111,18 @@ public class StopSequences implements Callable<Integer> {
     }
 
     private Stream<Trip> tripsForRouteAndDirection(Route route, String directionId) {
-        return dao.getTripsForRoute(route).stream()
+        return dao.getTripsForRoute(route)
+                .stream()
                 .filter(t -> t.getDirectionId().equals(directionId));
     }
 
-    @SuppressWarnings("UnstableApiUsage")
-    private Stream<MasterStopListEntry> stopSequencesForRouteAndDirection(Route route, String directionId) {
+    private Set<String> tripHeadsignsForRouteAndDirection(Route route, String directionId) {
+        return tripsForRouteAndDirection(route, directionId)
+                .map(Trip::getTripHeadsign)
+                .collect(toImmutableSet());
+    }
+
+    private DirectedAcyclicGraph<Stop, DefaultEdge> stopsDagForRouteAndDirection(Route route, String directionId) {
         final DirectedAcyclicGraph<Stop, DefaultEdge> stopsDag = new DirectedAcyclicGraph<>(DefaultEdge.class);
 
         tripsForRouteAndDirection(route, directionId)
@@ -98,10 +134,12 @@ public class StopSequences implements Callable<Integer> {
 
         tripsForRouteAndDirection(route, directionId)
                 .forEach(t -> {
-                    final PeekingIterator<StopTime> it = Iterators.peekingIterator(dao.getStopTimesForTrip(t)
-                            .stream()
-                            .filter(REVENUE_STOPTIME)
-                            .iterator());
+                    final PeekingIterator<StopTime> it = Iterators.peekingIterator(
+                            dao.getStopTimesForTrip(t)
+                                    .stream()
+                                    .filter(REVENUE_STOPTIME)
+                                    .iterator()
+                    );
 
                     while (it.hasNext()) {
                         final StopTime now = it.next();
@@ -112,22 +150,44 @@ public class StopSequences implements Callable<Integer> {
                             }
                         }
                     }
-
                 });
 
-        final TopologicalOrderIterator<Stop, DefaultEdge> stopIterator = new TopologicalOrderIterator<>(stopsDag,
-                new FerrisHeuristicStopComparator(stopsDag));
+        return stopsDag;
+    }
 
-        return mapWithIndex(stream(stopIterator),
-                (stop, index) -> new MasterStopListEntry(
-                        route.getShortName(),
-                        DIRECTIONS.get(directionId),
-                        (int) index + 1,
-                        stop.getId().getId(),
-                        "N",
-                        0,
-                        0,
-                        0));
+    @SuppressWarnings("UnstableApiUsage")
+    private Map<Stop, Long> stopSequences(DirectedAcyclicGraph<Stop, DefaultEdge> stopsDag) {
+        final TopologicalOrderIterator<Stop, DefaultEdge> stopIterator = new TopologicalOrderIterator<>(
+                stopsDag,
+                new FerrisHeuristicStopComparator(stopsDag)
+        );
+
+        return Streams.mapWithIndex(Streams.stream(stopIterator), ImmutablePair::of)
+                .collect(toImmutableMap(Pair::getKey, Pair::getValue));
+    }
+
+    private Stream<MasterStopListEntry> buildMasterStopListEntries(Route route,
+                                                                   String directionId,
+                                                                   Map<Stop, Long> stopSequences) {
+        return stopSequences
+                .entrySet()
+                .stream()
+                .map(e -> {
+                            final Stop stop = e.getKey();
+                            final long sequence = e.getValue();
+
+                            return new MasterStopListEntry(
+                                    route.getShortName(),
+                                    DIRECTIONS.get(directionId),
+                                    sequence + 1,
+                                    stop.getId().getId(),
+                                    "N",
+                                    0,
+                                    0,
+                                    0
+                            );
+                        }
+                );
     }
 }
 

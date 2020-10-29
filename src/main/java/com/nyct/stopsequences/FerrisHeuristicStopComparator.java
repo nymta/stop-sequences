@@ -19,6 +19,7 @@ import lombok.AllArgsConstructor;
 import org.gavaghan.geodesy.Ellipsoid;
 import org.gavaghan.geodesy.GeodeticCalculator;
 import org.gavaghan.geodesy.GlobalCoordinates;
+import org.jgrapht.Graphs;
 import org.jgrapht.graph.DefaultEdge;
 import org.jgrapht.graph.DirectedAcyclicGraph;
 import org.onebusaway.gtfs.model.Stop;
@@ -27,12 +28,11 @@ import java.util.*;
 
 @AllArgsConstructor
 class FerrisHeuristicStopComparator implements Comparator<Stop> {
-
     private final DirectedAcyclicGraph<Stop, DefaultEdge> graph;
 
     private final Map<Stop, Double> maxDistanceMap = new HashMap<>();
 
-    private final GeodeticCalculator gc = new GeodeticCalculator();
+    private static final GeodeticCalculator GC = new GeodeticCalculator();
 
     public int compare(Stop o1, Stop o2) {
         final double d1 = getMaxDistance(o1);
@@ -40,25 +40,33 @@ class FerrisHeuristicStopComparator implements Comparator<Stop> {
         return Double.compare(d2, d1);
     }
 
+    private static double computeDistance(Stop s1, Stop s2) {
+        return GC.calculateGeodeticCurve(
+                Ellipsoid.WGS84,
+                new GlobalCoordinates(s1.getLat(), s1.getLon()),
+                new GlobalCoordinates(s2.getLat(), s2.getLon())
+        )
+                .getEllipsoidalDistance();
+    }
+
     private double getMaxDistance(Stop stop) {
         return getMaxDistance(stop, new HashSet<>());
     }
 
     private double getMaxDistance(Stop stop, Set<Stop> visited) {
+        /*
+         * This looks like a great use case for Map.computeIfAbsent(), right?
+         * Unfortunately we can't, because getMaxDistance() updates the map recursively, which the contract for
+         * Map.computeIfAbsent() forbids: "The mapping function should not modify this map during computation."
+         */
         if (!maxDistanceMap.containsKey(stop)) {
             if (!visited.add(stop)) {
-                throw new IllegalStateException("cycle");
+                throw new IllegalStateException("Graph contains a cycle; this shouldn't be possible ");
             }
 
-            final double dMax = graph.getDescendants(stop)
+            final double dMax = Graphs.successorListOf(graph, stop)
                     .stream()
-                    .mapToDouble(next -> gc.calculateGeodeticCurve(
-                            Ellipsoid.WGS84,
-                            new GlobalCoordinates(stop.getLat(), stop.getLon()),
-                            new GlobalCoordinates(next.getLat(), next.getLon())
-                    )
-                            .getEllipsoidalDistance()
-                            + getMaxDistance(next, visited))
+                    .mapToDouble(next -> computeDistance(stop, next) + getMaxDistance(next, visited))
                     .max()
                     .orElse(0.0);
 
